@@ -1,0 +1,412 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  OutputBucketName:
+    Description: >-
+      OPTIONAL: Bucket Name where the zip file output should be placed, if left
+      blank a bucket name will be automatically generated.
+    Type: String
+    Default: ''
+  AllowedIps:
+    Description: >-
+      Comma seperated list of IP CIDR blocks for source IP used by api gateway.
+    Type: String
+    Default: 10.84.16.0/20
+  EncryptedAccessToken:
+    Description: >-
+      KMS encrypted access token with read access to repository"
+    Type: String
+    Default: ''
+    NoEcho: 'true'
+  KmsKey:
+    Description: >-
+      KMS ID for key used to decrypt access token"
+    Type: String
+    Default: '4b7dbafb-3d3f-452c-b164-ab5839edf326'
+Conditions:
+  UseAllowedIps: !Not 
+    - !Equals 
+      - !Ref AllowedIps
+      - ''
+Resources:
+  OutputBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Ref OutputBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      Tags: []
+  bitbuckettos3:
+    Type: 'AWS::Lambda::Function'
+    DependsOn:
+      - ZipDlRole
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt 
+        - ZipDlRole
+        - Arn
+      Code:
+        ZipFile: !Join 
+          - ''
+          - - |
+              from __future__ import print_function
+            - |
+              import boto3
+            - |
+              from botocore.vendored import requests
+            - |
+              from base64 import b64decode
+            - |
+              import json
+            - |
+              import logging
+            - |
+              import os
+            - |+
+
+            - |
+              logger = logging.getLogger()
+            - |
+              logger.setLevel(logging.INFO)
+            - >
+              logger.handlers[0].setFormatter(logging.Formatter('[%(asctime)s][%(levelname)s]
+              %(message)s'))
+            - |
+              logging.getLogger('boto3').setLevel(logging.ERROR)
+            - |
+              logging.getLogger('botocore').setLevel(logging.ERROR)
+            - |+
+
+            - |
+              s3_client = boto3.client('s3')
+            - |+
+
+            - |
+              def lambda_handler(event, context):
+            - |2
+                  OutputBucket=event['context']['output-bucket']
+            - |2
+                  temp_archive = '/tmp/archive.zip'
+            - |2
+                  rawvariable=os.environ['PAK'] 
+            - |2
+                  token = boto3.client('kms').decrypt(CiphertextBlob=b64decode(rawvariable))['Plaintext'].decode('utf-8') 
+            - |2
+                  owner = event['body-json']['actor']['name']
+            - |2
+                  repo = event['body-json']['repository']['name']
+            - |2
+                  project = event['body-json']['repository']['project']['name']
+            - |2
+                  bitbucket = 'https://secureremoteaccess.tech-01.net/bitbucket/rest/api/latest/projects/' + project
+            - |2
+                  #
+            - |2
+                  url = bitbucket + '/repos/' + repo + '/archive?format=zip'
+            - |2
+                  headers = {'Authorization':'Bearer %s'  %  token}
+            - |2
+                  r = requests.get(url, headers=headers)
+            - |2
+                  #
+            - |2
+                  s3_archive_file = "%s/%s/%s_%s.zip" % (owner,repo,owner,repo)
+            - |2
+                  with open(temp_archive, "wb") as codearchive:
+            - |2
+                      codearchive.write(r.content)
+            - |2
+                  # upload the archive to s3 bucket
+            - |2
+                  logger.info("Uploading zip to S3://%s/%s" % (OutputBucket,s3_archive_file))
+            - |2
+                  s3_client.upload_file(temp_archive,OutputBucket, s3_archive_file)
+            - |2
+                  logger.info('Upload Complete')
+            - ''
+      Runtime: python3.6
+      VpcConfig :
+        SecurityGroupIds:
+            - !Ref LambdagitSecurityGroup
+        SubnetIds:
+            - !ImportValue 'CoreVPC:PrivateSubnetAz1'
+            - !ImportValue 'CoreVPC:PrivateSubnetAz2'
+      Environment:
+        Variables:
+            PAK: !Ref EncryptedAccessToken
+  LambdagitSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Security group for VPC based lambda
+      VpcId: !ImportValue 'CoreVPC:VpcId'
+      SecurityGroupIngress:
+        - CidrIp: !ImportValue 'CoreVPC:AwsCidr'
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+      Tags:
+        - Key: Environment
+          Value: !ImportValue 'CoreVPC:Tags:Environment'
+        - Key: ProjectNumber
+          Value: !ImportValue 'CoreVPC:Tags:ProjectNumber'
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-sg'
+  ZipDlRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: git2cp-zipdl
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                Resource:
+                  - !Join 
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - !Ref OutputBucket
+                  - !Join 
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - !Ref OutputBucket
+                      - /*
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - 'arn:aws:logs:*:*:*'
+        - PolicyName: git2cp-vpconf
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:CreateNetworkInterface'
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:DeleteNetworkInterface'
+                Resource:
+                  - '*'
+        - PolicyName: git2cp-kms
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:*'
+                Resource:
+                  - !Join 
+                    - ''
+                    - - 'arn:aws:kms:eu-west-1:'
+                      - !Ref "AWS::AccountId"
+                      - ':key/'
+                      - !Ref KmsKey
+  WebHookRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - >-
+          arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+      Policies:
+        - PolicyName: git2cp-webhook
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeAsync'
+                  - 'lambda:InvokeFunction'
+                Resource:
+                  - !GetAtt 
+                    - bitbuckettos3
+                    - Arn
+  WebHookApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Body:
+        swagger: '2.0'
+        info:
+          version: '2016-07-26T07:34:38Z'
+        schemes:
+          - https
+        paths:
+          /zipdl:
+            post:
+              consumes:
+                - application/json
+              produces:
+                - application/json
+              responses:
+                '200':
+                  description: 200 response
+                  schema:
+                    $ref: '#/definitions/Empty'
+              x-amazon-apigateway-integration:
+                type: aws
+                credentials: !GetAtt 
+                  - WebHookRole
+                  - Arn
+                responses:
+                  default:
+                    statusCode: '200'
+                requestParameters:
+                  integration.request.header.X-Amz-Invocation-Type: '''Event'''
+                passthroughBehavior: when_no_templates
+                httpMethod: POST
+                uri: !Join 
+                  - ''
+                  - - 'arn:aws:apigateway:'
+                    - !Ref 'AWS::Region'
+                    - ':lambda:path//2015-03-31/functions/'
+                    - !GetAtt 
+                      - bitbuckettos3
+                      - Arn
+                    - /invocations
+                requestTemplates:
+                  application/json: !Join 
+                    - ''
+                    - - |
+                        #set($allParams = $input.params())
+                      - |
+                        {
+                      - |
+                        "body-json" : $input.json('$'),
+                      - |
+                        "params" : {
+                      - |
+                        #foreach($type in $allParams.keySet())
+                      - |2
+                            #set($params = $allParams.get($type))
+                      - |
+                        "$type" : {
+                      - |2
+                            #foreach($paramName in $params.keySet())
+                      - |2
+                            "$paramName" : "$util.escapeJavaScript($params.get($paramName))"
+                      - |2
+                                #if($foreach.hasNext),#end
+                      - |2
+                            #end
+                      - |
+                        }
+                      - |2
+                            #if($foreach.hasNext),#end
+                      - |
+                        #end
+                      - |
+                        },
+                      - |
+                        "stage-variables" : {
+                      - |
+                        #foreach($key in $stageVariables.keySet())
+                      - >
+                        "$key" :
+                        "$util.escapeJavaScript($stageVariables.get($key))"
+                      - |2
+                            #if($foreach.hasNext),#end
+                      - |
+                        #end
+                      - |
+                        },
+                      - |
+                        "context" : {
+                      - |2
+                            "account-id" : "$context.identity.accountId",
+                      - |2
+                            "api-id" : "$context.apiId",
+                      - |2
+                            "api-key" : "$context.identity.apiKey",
+                      - |2
+                            "authorizer-principal-id" : "$context.authorizer.principalId",
+                      - |2
+                            "caller" : "$context.identity.caller",
+                      - |2
+                            "cognito-authentication-provider" : "$context.identity.cognitoAuthenticationProvider",
+                      - |2
+                            "cognito-authentication-type" : "$context.identity.cognitoAuthenticationType",
+                      - |2
+                            "cognito-identity-id" : "$context.identity.cognitoIdentityId",
+                      - |2
+                            "cognito-identity-pool-id" : "$context.identity.cognitoIdentityPoolId",
+                      - |2
+                            "http-method" : "$context.httpMethod",
+                      - |2
+                            "stage" : "$context.stage",
+                      - |2
+                            "source-ip" : "$context.identity.sourceIp",
+                      - |2
+                            "user" : "$context.identity.user",
+                      - |2
+                            "user-agent" : "$context.identity.userAgent",
+                      - |2
+                            "user-arn" : "$context.identity.userArn",
+                      - |2
+                            "request-id" : "$context.requestId",
+                      - |2
+                            "resource-id" : "$context.resourceId",
+                      - |2
+                            "resource-path" : "$context.resourcePath",
+                      - |2
+                            "output-bucket" : "$stageVariables.outputbucket",
+                      - |2
+                            "git-token" : "$stageVariables.gittoken"
+                      - |2
+                            }
+                      - '}'
+        securityDefinitions:
+          sigv4:
+            type: apiKey
+            name: Authorization
+            in: header
+            x-amazon-apigateway-authtype: awsSigv4
+        definitions:
+          Empty:
+            type: object
+  WebHookApiDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    Properties:
+      RestApiId: !Ref WebHookApi
+      StageName: DummyStage
+  WebHookApiProdStage:
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      DeploymentId: !Ref WebHookApiDeployment
+      RestApiId: !Ref WebHookApi
+      StageName: Prod
+      Variables:
+        outputbucket: !Ref OutputBucket
+        allowedips: !If 
+          - UseAllowedIps
+          - !Ref AllowedIps
+          - !Ref 'AWS::NoValue' 
+
+Outputs:
+  ZipDownloadWebHookApi:
+    Value: !Join 
+      - ''
+      - - ' https://'
+        - !Ref WebHookApi
+        - .execute-api.
+        - !Ref 'AWS::Region'
+        - .amazonaws.com/
+        - !Ref WebHookApiProdStage
+        - /zipdl
